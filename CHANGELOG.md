@@ -4,6 +4,337 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
+## [13.2.0] - 2026-05-12
+
+## What's new
+
+### `wowerpoint` skill — kawaii NotebookLM slide-deck generator
+
+Turn one source document into a kawaii NotebookLM slide-deck PDF. Wraps the `notebooklm` CLI with the kawaii-prompt + `--format detailed` defaults and a spawn-subagent pattern so generation (~10 min) never blocks the main conversation.
+
+- **Single-source-per-deck** is enforced by the workflow shape: confirm or write the source doc *before* adding it to NotebookLM. Don't paper over a weak source by stacking more sources — write a comprehensive doc first.
+- **Slide-deck only.** Videos and podcasts from the same engine are noticeably worse and out of scope; the skill refers users to the `notebooklm` CLI directly for those formats.
+- **Default prompt template:** `Use kawaii characters to tell the story of <subject>. Keep it warm and clear.` Pass any user-supplied prompt through verbatim.
+- **Setup requires** `notebooklm-py` (via `uv tool install --with playwright`), `playwright install chromium`, and `jq`.
+- **Spawn-and-end-turn** pattern: the subagent's completion notification fires when the PDF is on disk; the main conversation never blocks on the ~10 min render.
+
+See PR #2430 for the full design notes and review history.
+
+## Skills inventory
+
+This release brings the plugin to **12 skills**: babysit, do, how-it-works, knowledge-agent, learn-codebase, make-plan, mem-search, pathfinder, smart-explore, timeline-report, version-bump, wowerpoint.
+
+## [13.1.0] - 2026-05-11
+
+## Server-beta event pipeline (phases 4–13)
+
+This release lands the full server-beta track developed on `server-beta-phase-4-event-pipeline` — a self-contained Postgres + BullMQ event-to-observation pipeline with API-key auth, team/project scope, audit log, three AI providers (Anthropic, OpenAI, Google), a dedicated MCP server, legacy compat adapters for existing worker clients, a Docker/Compose stack, and a generation-job retry/cancel surface.
+
+### Highlights
+
+- **Event pipeline**: `agent_event` → `observation_generation_jobs` (outbox) → BullMQ worker → `observation` row. Idempotent enqueue, request-id propagation end-to-end, structured audit log.
+- **API surface**: `POST /v1/events`, `POST /v1/sessions/start`, `POST /v1/sessions/:id/end`, generation-job list/retry/cancel, MCP routes, scoped reads.
+- **Legacy compat**: `/api/sessions/observations` and `/api/sessions/summarize` shims map legacy worker payloads into the new event/job model without touching worker code. Both shims now wrap session lookup in their try/catch so Postgres failures return structured JSON, and `resolveServerSession` survives TOCTOU races via 23505 catch-and-refetch.
+- **POST /v1/sessions/start** also catches 23505 on concurrent start with the same `externalSessionId` and refetches the winning row instead of returning 500.
+- **Generation providers**: Anthropic, OpenAI, and Google with per-team-project scope enforcement and error classification.
+- **Docker / Compose stack** and `bin/server-beta-cli` for local operator workflows.
+
+### Bug fixes
+
+- `resolveServerSession` Postgres errors no longer escape `asyncHandler.catch(next)` and return HTML 500s to legacy clients.
+- `POST /v1/sessions/start` no longer returns 500 to the loser of a concurrent same-`externalSessionId` race.
+
+Full PR thread: #2383.
+
+## [13.0.1] - 2026-05-10
+
+## Bug fixes
+
+### MCP server
+- **#2371** — drop `${_R%/}` parameter-expansion trim in `.mcp.json` that tripped Claude Code's MCP validator
+
+### Environment isolation
+- **#2357** — block `ANTHROPIC_BASE_URL` leak; use a three-branch OAuth-skip predicate
+- Add `CLAUDE_MEM_ENV_FILE` lazy resolver so tests (and multi-profile users) can redirect the env-file path without module-load-order constraints
+
+### Worker lifecycle
+- Classify Claude SDK HTTP 400 as **unrecoverable** so the worker stops retrying a doomed request
+- Stop hook crash hardened: `onclose` handler now performs background tree-kill on unexpected subprocess exit
+
+### Chroma
+- **#2313** — enforce a single `chroma-mcp` subprocess per worker (singleton via `disposeCurrentSubprocess()` on every code path; tree-kill of orphans on dispose)
+- Pin `onnxruntime>=1.20` and `protobuf<7` to fix `INVALID_PROTOBUF` on macOS arm64
+
+### Build
+- Polyfill `import.meta.url` to `pathToFileURL(__filename)` in the CJS worker bundle so ESM-style code resolves correctly (CodeRabbit-driven follow-up)
+
+### Tests / review
+- `tests/env-isolation.test.ts` no longer mutates the real `~/.claude-mem/.env`; OAuth spy wrapped in try/finally to avoid leaks across runs
+- 3 new chroma-mcp regression tests for #2313 (singleton enforcement)
+
+### Misc
+- Daily dependency bump per CLAUDE.md maintenance policy
+
+Full diff: https://github.com/thedotmack/claude-mem/pull/2394
+
+## [13.0.0] - 2026-05-08
+
+## Highlights
+
+This is the **claude-mem 13** major release, landing the Server Beta runtime and the project's relicense.
+
+### Server Beta runtime (opt-in)
+- Independent server-beta service with its own lifecycle (`claude-mem server start/status/stop`)
+- Postgres-backed observation storage
+- BullMQ + Redis observation queue engine (gated behind `CLAUDE_MEM_QUEUE_ENGINE=bullmq`, fail-fast)
+- New `/v1` REST API surface (events, sessions, memories, search, context, audit, jobs)
+- API-key auth + Better-Auth proxy
+- Outbox pattern for transactional event-to-job pipelines
+- Generation-job primitives (`ServerJobQueue`, `ActiveServerBetaQueueManager`, deterministic colon-free SHA-256 job IDs)
+- Docker Compose + E2E harness for the new stack
+
+### Licensing
+- Repository relicensed from **AGPL-3.0** to **Apache-2.0**
+- `NOTICE` file added
+- `docs/license.md` and `docs/ip-boundary.md` clarify the OSS / commercial boundary
+- `ragtime/` subproject also relicensed to Apache-2.0
+
+### Installer
+- Server Beta is exposed as an installer option (default off — open-source core is unaffected)
+
+## Migration notes
+- Existing users on the worker-era plugin keep working — no breaking changes for the default install
+- Server Beta is opt-in. Worker continues to run on its existing port and SQLite store.
+- See `docs/migration-worker-to-server.md` for forward-looking migration guidance
+
+## Compatibility
+- Node ≥ 20, Bun ≥ 1.0
+- Server Beta requires Postgres + Redis (only when enabled)
+
+Full diff: https://github.com/thedotmack/claude-mem/compare/v12.7.5...v13.0.0
+
+## [12.7.5] - 2026-05-07
+
+Patch release for npx installs that hit an existing Codex marketplace registration.
+
+Fixes:
+- If Codex already has claude-mem-local registered from a different source, the installer now removes that stale registration and re-adds the local npx marketplace instead of failing.
+- Keeps Codex plugin_hooks enablement and legacy AGENTS cleanup after the marketplace registration succeeds.
+- Updates the release workflow instructions to use npm run build-and-sync instead of plain npm run build so the local marketplace and worker are synced during releases.
+
+Validation:
+- npm run build-and-sync
+- bun test tests/install-non-tty.test.ts tests/infrastructure/plugin-distribution.test.ts tests/servers/mcp-tool-schemas.test.ts tests/setup-runtime.test.ts tests/hook-command.test.ts
+- Docker smoke with codex-cli 0.128.0 reproducing the remote-to-local marketplace source conflict and verifying install completion.
+- npx --yes claude-mem@12.7.5 --version
+
+## [12.7.4] - 2026-05-07
+
+Patch release for the Codex mem-search marketplace fix.
+
+Highlights:
+- Restores Codex access to the claude-mem MCP/search plugin by pointing the Codex marketplace at the bundled plugin root.
+- Adds resilient MCP launcher fallbacks for local installs, Codex plugin cache installs, Claude plugin cache installs, and remote marketplace clones.
+- Registers Codex plugin marketplaces during install, enables plugin_hooks, and cleans up legacy AGENTS-based Codex context injection.
+- Includes the Codex session-start hook migration and Codex version-mismatch investigation plan.
+
+Validation:
+- npm run build
+- bun test tests/install-non-tty.test.ts tests/infrastructure/plugin-distribution.test.ts tests/servers/mcp-tool-schemas.test.ts tests/setup-runtime.test.ts tests/hook-command.test.ts
+- Docker smoke with codex-cli 0.128.0 for local install, remote marketplace add/upgrade, and MCP initialize.
+
+## [12.7.3] - 2026-05-07
+
+Patch release for the reliability fixes merged in PR #2344.
+
+- Stops context-overflow and quota hard-stop failures from restarting observer generators and burning subscription quota.
+- Makes Stop hook transcript lookup failures non-blocking, so missing worktree transcript paths do not re-wake Claude Code in a loop.
+- Hardens MCP/plugin startup path resolution when host plugin-root environment variables are absent.
+- Accepts legacy install markers while keeping new marker writes on the JSON format.
+- Fixes export-memories to honor isolated data dirs, validate worker ports, and send the worker route's canonical session-id field.
+- Makes pending_messages repair safer and removes stale worker_pid assumptions from the current queue/schema path.
+- Adds a focused PR babysit status helper for low-noise review/check monitoring.
+
+## [12.7.2] - 2026-05-06
+
+### Fixed
+- Disable Claude Code built-in auto-memory during claude-code installs by setting `CLAUDE_CODE_DISABLE_AUTO_MEMORY=1` in Claude settings.
+- Make JSON config writes crash-safe, durable, symlink-safe, and safe for dangling symlink destinations.
+- Add regression coverage for atomic JSON writes through symlinked and dangling-symlink settings paths.
+
+## [12.7.1] - 2026-05-06
+
+## Added
+- Package the new `babysit` skill for monitoring PR checks, review comments, and unresolved review threads until a PR is merge-ready.
+
+## Verification
+- `npm run build`
+- `npm publish` completed for `claude-mem@12.7.1`
+
+## [12.7.0] - 2026-05-06
+
+## Added
+- Add native Codex hooks integration through the Codex plugin marketplace.
+- Add Codex hook payload normalization, file-context extraction, and Stop hook observation support.
+- Add Codex installer support for `npx claude-mem@latest install` with Codex CLI version guidance.
+
+## Fixed
+- Avoid slow observation flow retries by replacing the worker-side initialization wait with hook-side readiness polling.
+- Keep Codex file-context extraction from consuming boolean flags like `cat -n`.
+- Include `bun-runner.js` in hook distribution verification.
+
+## [12.6.4] - 2026-05-05
+
+## Fixed
+- Drain invalid/non-XML observer responses so pending agent observations are cleared instead of retrying forever (PR #2316 / issue #2315).
+- Correct all plugin manifest versions so Claude, Codex, OpenClaw, bundled plugin, and npm metadata agree on 12.6.4.
+
+## [12.6.5] - 2026-05-05
+
+### Added
+- Installer now keeps the Claude Agent SDK as the single memory-agent path while supporting subscription auth, direct Anthropic API keys, and LiteLLM/custom gateway setup.
+- Added gateway env support for `ANTHROPIC_AUTH_TOKEN` alongside `ANTHROPIC_BASE_URL`.
+
+### Fixed
+- Removed the fixed agent-pool slot timeout so queued memory-agent work waits for process availability instead of dropping pending messages under load.
+- Reset generator failures back to pending messages instead of clearing queued work.
+
+## [12.6.2] - 2026-05-05
+
+## Fix: `npx claude-mem@latest install` no longer hangs on tree-sitter-swift
+
+### What broke in 12.6.1
+
+PR #2300 moved 21 tree-sitter grammar packages from root `devDependencies` → root `dependencies`. As a result, `npx claude-mem@12.6.1 install` started fetching all 21 grammars at npx time. `tree-sitter-swift`'s postinstall pulled a nested `tree-sitter-cli` that downloads a Rust binary from GitHub and SIGINT'd the install:
+
+```
+npm error path .../node_modules/claude-mem/node_modules/tree-sitter-swift/node_modules/tree-sitter-cli
+npm error command failed
+npm error signal SIGINT
+npm error Downloading https://github.com/tree-sitter/tree-sitter/releases/download/v0.23.2/tree-sitter-macos-arm64.gz
+```
+
+npm doesn't honor the bun-only `trustedDependencies` allowlist, so postinstalls always run on a bare `npx` fetch.
+
+### Fix (PR #2305)
+
+Move the 21 grammar packages back to root `devDependencies`. The marketplace plugin install path is untouched — `plugin/package.json` keeps them as runtime deps and `bun install` (in `installPluginDependencies`) honors `trustedDependencies: ["tree-sitter-cli"]` to skip the harmful postinstalls on every other grammar. Smart-search/smart-outline/smart-unfold continue to work end-to-end.
+
+PR #2300's `--legacy-peer-deps` and `--omit=dev` install.ts changes are kept — they fix a separate, valid marketplace ERESOLVE.
+
+## [12.6.1] - 2026-05-05
+
+## Patch release
+
+### Fixed
+- **install:** marketplace `npm install` no longer fails on tree-sitter peer-dep ERESOLVE. Tree-sitter grammar packages moved from `devDependencies` to `dependencies` and the install command updated to `--omit=dev --legacy-peer-deps` (#2300).
+- **chroma-mcp:** removed ONNX/OpenBLAS thread cap from spawn env to restore performance on multi-core systems.
+
+### Docs
+- Documented the `--legacy-peer-deps` rationale in `runNpmInstallInMarketplace`.
+
+## [12.6.0] - 2026-05-04
+
+## Highlights
+
+**17 issues fixed** and **4 new foundations** introduced via PR #2282 — a 24-cycle review-loop landed across 33 commits.
+
+### New capabilities
+
+- **OAuth keychain reader** (#2215) — `readClaudeOAuthToken()` reads from platform-native credential stores (macOS keychain, Windows DPAPI, Linux libsecret) at worker spawn-time. JWT exp / sidecar `expiresAt` validation refuses stale tokens. Re-login hint surfaced via SessionStart `additionalContext`.
+- **Quota-aware wall-clock guard** (#2234) — new `RateLimitStore` with auth-type gate: `api_key` never aborts; cli/oauth aborts at per-window thresholds (5h:0.95, 7d_opus:0.93, 7d_sonnet:0.92). 15min reset-grace buffer with 0.85 utilization floor. `rateLimits` exposed on `/api/health`.
+- **Network retry helper** (#2254) — `withRetry` honors `ClassifiedProviderError.kind`, exponential backoff with jitter, request-id capture for dedup logging.
+
+### Foundations (new public modules)
+
+- **F1 `spawnHidden`** (`src/shared/spawn.ts`) — `windowsHide: true` default; 8 spawn sites adopted.
+- **F2 `paths`** (`src/shared/paths.ts`) — 24 hardcoded `homedir() + '.claude-mem'` sites collapsed into 18 named accessors. `CLAUDE_MEM_DATA_DIR` flows through 100% of runtime. Self-extending invariant test.
+- **F3 `getUptimeSeconds`** (`src/shared/uptime.ts`) — fixes ms-bug at `Server.ts:165`.
+- **F4 `ClassifiedProviderError`** (`src/services/worker/provider-errors.ts`) — `kind` union (`transient | unrecoverable | rate_limit | quota_exhausted | auth_invalid`); per-provider classifiers; `unrecoverablePatterns` allowlist deleted.
+
+### Bug fixes
+
+- #2188 — empty stdin no longer falls back to `'{}'`; diagnostic log + `CAPTURE_BROKEN` marker
+- #2196 — `ANTHROPIC_BASE_URL` documentation added
+- #2220 / #2253 — chroma-mcp CPU storm (Windows + macOS): thread caps, per-batch watermarks, telemetry off, `killProcessTree` on shutdown
+- #2225 — opencode `_zod.def` crash: Zod schemas replace plain JSON-schema arg shapes
+- #2231 — `SECURITY.md` at repo root populates GitHub Security tab
+- #2233 — Part A: `stripCodeFences()` + fence example removed from prompt (Part B deferred)
+- #2236 — observer agent visible windows on Windows (consumed F1)
+- #2237 / #2238 — hardcoded paths (consumed F2)
+- #2240 — dedupe `observationIds` before Chroma sync
+- #2242 — `check-pending-queue.ts` points at `/api/processing-status` + `/api/processing`; honors `CLAUDE_MEM_WORKER_PORT`
+- #2243 — `scripts/sync-marketplace.cjs` rsync excludes stale `scripts/package.json` + `scripts/node_modules`
+- #2244 — `unrecoverablePatterns` allowlist deleted; worker dispatches on `error.kind`
+- #2247 — Codex `task_complete` event added to session-end matched types
+- #2248 — Cursor sessions never summarized: 3 bugs in stop→summarize path fixed (transcriptPath, type-only match, empty-text first-match) — 10-case regression test added
+- #2250 — health endpoint uptime returns seconds (consumed F3)
+- #2222 — `CLAUDE_CODE_PATH` desktop-app silent fail: rejects `Claude.exe` paths, falls back to real CLI binary
+
+### Tests / CI
+
+- 1454 pass / 77 fail — matches main baseline, zero net regressions
+- All CI green: build, CodeRabbit (17 rounds resolved), Greptile (clean)
+
+### Out of scope (deferred)
+
+#2213 dual-queue avalanche, #2256 unbounded transcript retention, #2217 observation chunking, #2202 codex compression provider, #2249 Codex hook lifecycle migration, #2218 installer cache cleanup, #2167 parallel-agent throughput, #2191 Kiro IDE, #2212 Windows PTY, #2166 stable/beta channels.
+
+---
+
+**Full diff:** d384d3c5 → a3b161f8
+
+## [12.5.1] - 2026-05-03
+
+## Fixed
+
+- **Install failure on Node 25+** — `bun install` no longer fails when trying to compile the unused `tree-sitter` runtime against Node 25's V8 headers (which require C++20). Added `trustedDependencies: ["tree-sitter-cli"]` to the plugin manifest so bun runs only the CLI's prebuilt-binary download script and skips all other lifecycle scripts — including the failing native compile and the unused `.node` bindings of all 24+ grammar packages. claude-mem only ever shells out to the prebuilt `tree-sitter-cli` Rust binary; the runtime native module was never imported. (#2278)
+
+## Internal
+
+- Sync the OpenClaw plugin manifest version (10.4.1 → 12.5.1) so it tracks with the rest of the package going forward; the version-bump skill already lists it but past releases skipped it.
+
+## [12.5.0] - 2026-05-02
+
+## Highlights
+
+**Observation pipeline cleanup — kill the per-message retry counter.** The AI's parseable response is the only success signal; any other response (unparseable, empty, transport error) is a no-op. No more silent data loss after 3 retries.
+
+## What changed
+
+- **Parser:** collapsed to binary `{ valid: true, observations, summary } | { valid: false }`. No more `kind`/`skipped` enum dispatch in callers.
+- **ResponseProcessor:** two branches only — parseable → store + clear pending → broadcast; not parseable → reset claimed-but-unprocessed messages to pending. Removed per-message FIFO popping and the summarize-special-case best-effort confirm.
+- **PendingMessageStore:** 226 → 165 lines. Removed `markFailed` (the retry counter that silently dropped data after 3 attempts), `transitionMessagesTo`, `confirmProcessed`, `clearFailedOlderThan`, plus four other dead methods.
+- **Provider cleanup:** removed `processingMessageIds` tracking from Claude, Gemini, OpenRouter providers. The session-scoped clear handles the success path; no per-message in-flight tracking needed.
+- **GeneratorExitHandler:** drain-in-flight loop deleted; hard-stop / restart-guard paths now just clear pending for the session.
+- **Schema migration v31 + v32:** dropped four dead columns from `pending_messages` — `retry_count`, `failed_at_epoch`, `completed_at_epoch`, `worker_pid`. Status enum reduced to `'pending' | 'processing'` (the unreachable `'processed'` and `'failed'` are gone).
+
+## Bug fixes / polish
+
+- **`SessionQueueProcessor`:** removed two arbitrary 1-second recovery sleeps after error in `claimNextMessage`/`waitForMessage`; let the iterator end cleanly so `GeneratorExitHandler` can restart it.
+- **`Server.ts` + `SettingsRoutes.ts`:** unified four magic-number `setTimeout` exit-flush patterns (100ms × 2, 1000ms × 2) into one `flushResponseThen` helper using `res.on('finish', ...)`.
+- **PR review feedback (21+ threads):** install.ts argument fixes, settings cache TTL, Dockerfile login-banner sourcing, docs port-model + Node version updates, regex whitespace fix, Date.UTC for year-mismatch test, sync-marketplace port range guard, banner inflate fail-open, version-bump arg validation.
+
+## Net diff
+
+`-181 lines` (worker-service.cjs unaffected; total source lines down).
+
+## Migration
+
+Existing databases auto-migrate on worker startup (schema v31 + v32 drop the dead columns). No user action needed.
+
+## [12.4.9] - 2026-04-30
+
+Patches in 7 critical fixes from PR #2219 (integration/critical-fixes-april):
+
+- #2211 build/bundle drift — remove stale macOS binary + regen artifacts (closes #2158, #2200, #2154)
+- #2204 strip privacy tags before summarization (closes #2149)
+- #2205 preserve relevance order in semantic search (closes #2153)
+- #2208 restore Windows spawn (PR #751 re-apply) + Windows CI
+- #2209 Codex transcript ingestion + queue self-deadlock on Windows (closes #2192)
+- #2206 isolate SDK boundary — close 6 issues at 3 call sites
+- #2210 standalone batch — npm peer deps, marketplace self-heal, cache prune
+
 ## [12.4.8] - 2026-04-28
 
 ## Bug Fixes

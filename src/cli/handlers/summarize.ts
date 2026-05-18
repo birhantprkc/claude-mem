@@ -1,34 +1,28 @@
-/**
- * Summarize Handler - Stop
- *
- * Fire-and-forget: queue the summarize request and exit. The worker handles
- * summary generation, storage, and session cleanup asynchronously. The Stop
- * hook does not wait for any of it — Claude Code must exit immediately.
- * Session-complete cleanup is performed by the SessionEnd handler.
- */
 
 import type { EventHandler, NormalizedHookInput, HookResult } from '../types.js';
 import { executeWithWorkerFallback, isWorkerFallback } from '../../shared/worker-utils.js';
 import { logger } from '../../utils/logger.js';
 import { extractLastMessage } from '../../shared/transcript-parser.js';
+import { stripMemoryTagsFromPrompt } from '../../utils/tag-stripping.js';
 import { HOOK_EXIT_CODES } from '../../shared/hook-constants.js';
 import { normalizePlatformSource } from '../../shared/platform-source.js';
 import { shouldTrackProject } from '../../shared/should-track-project.js';
+import { resolveRuntimeContext, logServerBetaFallback } from '../../services/hooks/runtime-selector.js';
+import { isServerBetaClientError } from '../../services/hooks/server-beta-client.js';
 
 export const summarizeHandler: EventHandler = {
   async execute(input: NormalizedHookInput): Promise<HookResult> {
-    // Skip Stop hook entirely when firing from an excluded project (notably
-    // OBSERVER_SESSIONS_DIR). Without this, the SDK observer's own Stop hook
-    // queues summaries against its meta-session and triggers a recovery loop.
     if (input.cwd && !shouldTrackProject(input.cwd)) {
       return { continue: true, suppressOutput: true, exitCode: HOOK_EXIT_CODES.SUCCESS };
     }
 
-    // Skip summaries in subagent context — subagents do not own the session summary.
-    // Gate on agentId only: that field is present exclusively for Task-spawned subagents.
-    // agentType alone (no agentId) indicates `--agent`-started main sessions, which still
-    // own their summary. Do this BEFORE the worker call so a subagent Stop hook
-    // does not bootstrap the worker.
+    if (input.stopHookActive === true) {
+      logger.debug('HOOK', 'Skipping summary: Codex Stop hook re-entry detected', {
+        sessionId: input.sessionId,
+      });
+      return { continue: true, suppressOutput: true, exitCode: HOOK_EXIT_CODES.SUCCESS };
+    }
+
     if (input.agentId) {
       logger.debug('HOOK', 'Skipping summary: subagent context detected', {
         sessionId: input.sessionId,
@@ -40,32 +34,32 @@ export const summarizeHandler: EventHandler = {
 
     const { sessionId, transcriptPath } = input;
 
-    // Validate required fields before processing
     if (!sessionId) {
       logger.warn('HOOK', 'summarize: No sessionId provided, skipping');
       return { continue: true, suppressOutput: true, exitCode: HOOK_EXIT_CODES.SUCCESS };
     }
-    if (!transcriptPath) {
-      // No transcript available - skip summary gracefully (not an error)
-      logger.debug('HOOK', `No transcriptPath in Stop hook input for session ${sessionId} - skipping summary`);
-      return { continue: true, suppressOutput: true, exitCode: HOOK_EXIT_CODES.SUCCESS };
-    }
 
-    // Extract last assistant message from transcript (the work Claude did)
-    // Note: "user" messages in transcripts are mostly tool_results, not actual user input.
-    // The user's original request is already stored in user_prompts table.
     let lastAssistantMessage = '';
-    try {
-      lastAssistantMessage = extractLastMessage(transcriptPath, 'assistant', true);
-    } catch (err) {
-      logger.warn('HOOK', `Stop hook: failed to extract last assistant message for session ${sessionId}: ${err instanceof Error ? err.message : err}`);
-      return { continue: true, suppressOutput: true, exitCode: HOOK_EXIT_CODES.SUCCESS };
+
+    if (input.lastAssistantMessage !== undefined) {
+      lastAssistantMessage = stripMemoryTagsFromPrompt(input.lastAssistantMessage);
+    } else {
+      if (!transcriptPath) {
+        logger.debug('HOOK', `No transcriptPath in Stop hook input for session ${sessionId} - skipping summary`);
+        return { continue: true, suppressOutput: true, exitCode: HOOK_EXIT_CODES.SUCCESS };
+      }
+
+      try {
+        lastAssistantMessage = extractLastMessage(transcriptPath, 'assistant', true);
+        lastAssistantMessage = stripMemoryTagsFromPrompt(lastAssistantMessage);
+      } catch (err) {
+        logger.warn('HOOK', `Stop hook: failed to extract last assistant message for session ${sessionId}: ${err instanceof Error ? err.message : err}`);
+        return { continue: true, suppressOutput: true, exitCode: HOOK_EXIT_CODES.SUCCESS };
+      }
     }
 
-    // Skip summary if transcript has no assistant message (prevents repeated
-    // empty summarize requests that pollute logs — upstream bug)
     if (!lastAssistantMessage || !lastAssistantMessage.trim()) {
-      logger.debug('HOOK', 'No assistant message in transcript - skipping summary', {
+      logger.debug('HOOK', 'No assistant message available - skipping summary', {
         sessionId,
         transcriptPath
       });
@@ -78,7 +72,53 @@ export const summarizeHandler: EventHandler = {
 
     const platformSource = normalizePlatformSource(input.platform);
 
-    // 1. Queue summarize request — worker returns immediately with { status: 'queued' }
+    const runtime = resolveRuntimeContext();
+    if (runtime.runtime === 'server-beta') {
+      try {
+        // Resolve the server_session_id idempotently. /v1/sessions/start is
+        // idempotent on (projectId, externalSessionId) and returns the
+        // existing row when present.
+        const startResult = await runtime.client.startSession({
+          projectId: runtime.projectId,
+          externalSessionId: sessionId,
+          contentSessionId: sessionId,
+          platformSource,
+        });
+        const serverSessionId = startResult.session.id;
+        // Record the last assistant message as an event before closing the
+        // session so it lands in the generation pipeline.
+        await runtime.client.recordEvent({
+          projectId: runtime.projectId,
+          serverSessionId,
+          contentSessionId: sessionId,
+          sourceType: 'hook',
+          eventType: 'assistant_message',
+          occurredAtEpoch: Date.now(),
+          payload: {
+            last_assistant_message: lastAssistantMessage,
+            platformSource,
+          },
+        });
+        await runtime.client.endSession({ sessionId: serverSessionId });
+        logger.debug('HOOK', 'Summary request queued via server-beta');
+        return { continue: true, suppressOutput: true, exitCode: HOOK_EXIT_CODES.SUCCESS };
+      } catch (error: unknown) {
+        if (isServerBetaClientError(error) && error.isFallbackEligible()) {
+          logServerBetaFallback(error.kind, {
+            status: error.status,
+            message: error.message,
+            route: '/v1/sessions/end',
+          });
+          // fall through to worker fallback
+        } else {
+          logger.error('HOOK', 'Server beta summarize failed (non-recoverable)', {
+            error: error instanceof Error ? error.message : String(error),
+          });
+          return { continue: true, suppressOutput: true, exitCode: HOOK_EXIT_CODES.SUCCESS };
+        }
+      }
+    }
+
     const queueResult = await executeWithWorkerFallback<{ status?: string }>(
       '/api/sessions/summarize',
       'POST',
@@ -93,6 +133,6 @@ export const summarizeHandler: EventHandler = {
     }
 
     logger.debug('HOOK', 'Summary request queued, exiting hook');
-    return { continue: true, suppressOutput: true };
+    return { continue: true, suppressOutput: true, exitCode: HOOK_EXIT_CODES.SUCCESS };
   },
 };

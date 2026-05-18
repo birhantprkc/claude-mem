@@ -1,22 +1,10 @@
-/**
- * Runtime command routing for `npx claude-mem start|stop|restart|status|search|transcript`.
- *
- * These commands delegate to the installed plugin's worker-service.cjs via Bun,
- * or hit the worker's HTTP API directly (for `search`).
- *
- * Pure Node.js — no Bun APIs used.
- */
-import { spawn } from 'child_process';
+import { spawnHidden } from '../../shared/spawn.js';
 import { existsSync } from 'fs';
 import { join } from 'path';
 import pc from 'picocolors';
 import { resolveBunBinaryPath } from '../utils/bun-resolver.js';
 import { isPluginInstalled, marketplaceDirectory } from '../utils/paths.js';
 import { SettingsDefaultsManager } from '../../shared/SettingsDefaultsManager.js';
-
-// ---------------------------------------------------------------------------
-// Installation guard
-// ---------------------------------------------------------------------------
 
 function ensureInstalledOrExit(): void {
   if (!isPluginInstalled()) {
@@ -25,10 +13,6 @@ function ensureInstalledOrExit(): void {
     process.exit(1);
   }
 }
-
-// ---------------------------------------------------------------------------
-// Bun guard
-// ---------------------------------------------------------------------------
 
 function resolveBunOrExit(): string {
   const bunPath = resolveBunBinaryPath();
@@ -41,17 +25,13 @@ function resolveBunOrExit(): string {
   return bunPath;
 }
 
-// ---------------------------------------------------------------------------
-// Worker-service path
-// ---------------------------------------------------------------------------
-
 function workerServiceScriptPath(): string {
   return join(marketplaceDirectory(), 'plugin', 'scripts', 'worker-service.cjs');
 }
 
-// ---------------------------------------------------------------------------
-// Spawn helper
-// ---------------------------------------------------------------------------
+function serverBetaServiceScriptPath(): string {
+  return join(marketplaceDirectory(), 'plugin', 'scripts', 'server-beta-service.cjs');
+}
 
 function spawnBunWorkerCommand(command: string, extraArgs: string[] = []): void {
   ensureInstalledOrExit();
@@ -66,7 +46,7 @@ function spawnBunWorkerCommand(command: string, extraArgs: string[] = []): void 
 
   const args = [workerScript, command, ...extraArgs];
 
-  const child = spawn(bunPath, args, {
+  const child = spawnHidden(bunPath, args, {
     stdio: 'inherit',
     cwd: marketplaceDirectory(),
     env: process.env,
@@ -82,9 +62,55 @@ function spawnBunWorkerCommand(command: string, extraArgs: string[] = []): void 
   });
 }
 
-// ---------------------------------------------------------------------------
-// Public API
-// ---------------------------------------------------------------------------
+function spawnBunServerBetaCommand(command: string, extraArgs: string[] = []): void {
+  ensureInstalledOrExit();
+  const bunPath = resolveBunOrExit();
+  const serverScript = serverBetaServiceScriptPath();
+
+  if (!existsSync(serverScript)) {
+    console.error(pc.red(`Server beta script not found at: ${serverScript}`));
+    console.error('The installation may be corrupted. Try: npx claude-mem install');
+    process.exit(1);
+  }
+
+  const child = spawnHidden(bunPath, [serverScript, command, ...extraArgs], {
+    stdio: 'inherit',
+    cwd: marketplaceDirectory(),
+    env: process.env,
+  });
+
+  child.on('error', (error) => {
+    console.error(pc.red(`Failed to start Bun: ${error.message}`));
+    process.exit(1);
+  });
+
+  child.on('close', (exitCode) => {
+    process.exit(exitCode ?? 0);
+  });
+}
+
+export function runServerBetaStartCommand(): void {
+  spawnBunServerBetaCommand('start');
+}
+
+export function runServerBetaStopCommand(): void {
+  spawnBunServerBetaCommand('stop');
+}
+
+export function runServerBetaRestartCommand(): void {
+  spawnBunServerBetaCommand('restart');
+}
+
+export function runServerBetaStatusCommand(): void {
+  spawnBunServerBetaCommand('status');
+}
+
+// Phase 10 — start the BullMQ generation worker (no HTTP). Use this in
+// Compose to scale generation horizontally while a single (or multiple)
+// HTTP-only server-beta replicas serve writes/reads.
+export function runServerBetaWorkerStartCommand(): void {
+  spawnBunServerBetaCommand('worker', ['start']);
+}
 
 export function runStartCommand(): void {
   spawnBunWorkerCommand('start');
@@ -102,12 +128,10 @@ export function runStatusCommand(): void {
   spawnBunWorkerCommand('status');
 }
 
-/**
- * Stamp merged-worktree provenance on observations/summaries and keep Chroma
- * metadata in lockstep. Delegates to the worker-service.cjs `adopt` subcommand
- * so adoption runs in Bun (needed for bun:sqlite) while preserving the user's
- * working directory — that's what the engine uses to locate the parent repo.
- */
+export function runServerApiKeyCommand(extraArgs: string[] = []): void {
+  spawnBunWorkerCommand('server', ['api-key', ...extraArgs]);
+}
+
 export function runAdoptCommand(extraArgs: string[] = []): void {
   ensureInstalledOrExit();
   const bunPath = resolveBunOrExit();
@@ -119,12 +143,10 @@ export function runAdoptCommand(extraArgs: string[] = []): void {
     process.exit(1);
   }
 
-  // Pass user's cwd explicitly via --cwd because we override cwd on spawn to
-  // marketplaceDirectory() (required for the worker's own file resolution).
   const userCwd = process.cwd();
   const args = [workerScript, 'adopt', '--cwd', userCwd, ...extraArgs];
 
-  const child = spawn(bunPath, args, {
+  const child = spawnHidden(bunPath, args, {
     stdio: 'inherit',
     cwd: marketplaceDirectory(),
     env: process.env,
@@ -140,18 +162,10 @@ export function runAdoptCommand(extraArgs: string[] = []): void {
   });
 }
 
-/**
- * Run the one-time v12.4.3 pollution cleanup, or preview it via --dry-run.
- * Delegates to the worker-service.cjs `cleanup` subcommand so the scan and
- * (optional) deletion run in Bun (needed for bun:sqlite). (#2126 item 5)
- */
 export function runCleanupCommand(extraArgs: string[] = []): void {
   spawnBunWorkerCommand('cleanup', extraArgs);
 }
 
-/**
- * Search the worker API at `GET /api/search?query=<query>`.
- */
 export async function runSearchCommand(queryParts: string[]): Promise<void> {
   ensureInstalledOrExit();
 
@@ -161,9 +175,6 @@ export async function runSearchCommand(queryParts: string[]): Promise<void> {
     process.exit(1);
   }
 
-  // Resolve port via SettingsDefaultsManager so CLAUDE_MEM_WORKER_PORT env
-  // takes priority and the per-UID default (37700 + uid % 100) is used
-  // otherwise. Required for multi-account isolation (#2101).
   const workerPort = SettingsDefaultsManager.get('CLAUDE_MEM_WORKER_PORT');
   const searchUrl = `http://127.0.0.1:${workerPort}/api/search?query=${encodeURIComponent(query)}`;
 
@@ -208,9 +219,6 @@ export async function runSearchCommand(queryParts: string[]): Promise<void> {
   }
 }
 
-/**
- * Start the transcript watcher via Bun.
- */
 export function runTranscriptWatchCommand(): void {
   ensureInstalledOrExit();
   const bunPath = resolveBunOrExit();
@@ -223,12 +231,11 @@ export function runTranscriptWatchCommand(): void {
   );
 
   if (!existsSync(transcriptWatcherPath)) {
-    // Fall back to worker-service with transcript subcommand
     spawnBunWorkerCommand('transcript', ['watch']);
     return;
   }
 
-  const child = spawn(bunPath, [transcriptWatcherPath, 'watch'], {
+  const child = spawnHidden(bunPath, [transcriptWatcherPath, 'watch'], {
     stdio: 'inherit',
     cwd: marketplaceDirectory(),
     env: process.env,

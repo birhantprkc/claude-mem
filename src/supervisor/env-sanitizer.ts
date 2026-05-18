@@ -6,11 +6,6 @@ export const ENV_EXACT_MATCHES = new Set([
   'MCP_SESSION_ID',
 ]);
 
-/**
- * Proxy-related env vars stripped before spawning the worker / `claude` subprocess.
- * The user's proxy config bleeding into internal AI calls causes connection failures
- * (see issues #2115, #2099). Stripped unconditionally — no opt-in flag.
- */
 export const ENV_PROXY_VARS = new Set([
   'HTTP_PROXY',
   'HTTPS_PROXY',
@@ -24,10 +19,20 @@ export const ENV_PROXY_VARS = new Set([
   'npm_config_https_proxy',
 ]);
 
-/** Vars that start with CLAUDE_CODE_ but must be preserved for subprocess auth/tooling */
 export const ENV_PRESERVE = new Set([
   'CLAUDE_CODE_OAUTH_TOKEN',
   'CLAUDE_CODE_GIT_BASH_PATH',
+  'CLAUDE_CODE_USE_BEDROCK',
+  'CLAUDE_CODE_USE_VERTEX',
+  'ANTHROPIC_BEDROCK_BASE_URL',
+  'AWS_REGION',
+  'AWS_PROFILE',
+  'AWS_ACCESS_KEY_ID',
+  'AWS_SECRET_ACCESS_KEY',
+  'AWS_SESSION_TOKEN',
+  'ANTHROPIC_VERTEX_PROJECT_ID',
+  'CLOUD_ML_REGION',
+  'GOOGLE_APPLICATION_CREDENTIALS',
 ]);
 
 export function sanitizeEnv(env: NodeJS.ProcessEnv = process.env): NodeJS.ProcessEnv {
