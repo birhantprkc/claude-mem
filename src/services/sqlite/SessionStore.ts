@@ -36,6 +36,41 @@ import {
   type CanonicalMutation,
 } from '../sync/CanonicalContent.js';
 
+let warnedMissingIterate = false;
+
+/**
+ * Iterate a prepared statement's rows, preferring the streaming `.iterate()`
+ * added in Bun v1.1.31 and falling back to the materializing `.all()` on
+ * older runtimes.
+ *
+ * package.json declares `engines.bun >= 1.1.31`, but engines is advisory —
+ * nothing enforces it when the plugin is installed through the Claude Code
+ * marketplace. On an older Bun the bare `.iterate()` call threw
+ * "…iterate is not a function" from inside schema migration v46, which runs
+ * during background init. That rejection left the worker permanently
+ * `initialized:false` while still serving 200 on /api/health, so every hook
+ * silently skipped until the failure counter began blocking them outright.
+ *
+ * Falling back keeps the migration correct on old runtimes (it only costs
+ * peak memory, and this scan runs once per install) and the one-time warning
+ * names the real cause instead of a cryptic TypeError.
+ */
+function streamRows(statement: {
+  iterate?: () => Iterable<unknown>;
+  all: () => unknown[];
+}): Iterable<unknown> {
+  if (typeof statement.iterate === 'function') return statement.iterate();
+  if (!warnedMissingIterate) {
+    warnedMissingIterate = true;
+    logger.warn('DB', 'bun:sqlite lacks Statement.iterate(); falling back to .all()', {
+      bunVersion: typeof Bun !== 'undefined' ? Bun.version : 'unknown',
+      requiredBunVersion: '>=1.1.31',
+      impact: 'migration rows are materialized in memory; upgrade Bun to restore streaming',
+    });
+  }
+  return statement.all();
+}
+
 interface IndexColumnInfo {
   seqno: number;
   cid: number;
@@ -96,6 +131,19 @@ interface SummaryDetailRow {
   created_at_epoch: number;
 }
 
+export interface SessionStoreOptions {
+  /**
+   * Whether this store may enqueue mutation ops into sync_outbox. The only
+   * consumer of that queue is CloudSync's drain, and DatabaseManager
+   * constructs CloudSync iff cloud sync is fully credentialed — so the
+   * worker bootstrap passes the same configuration state here, and an
+   * unconfigured install produces no ops it can never drain. Defaults to
+   * true (the pre-flag behavior) for direct constructions that never wire
+   * the flag.
+   */
+  syncOpsEnabled?: boolean;
+}
+
 interface SdkSessionDetailRow {
   id: number;
   content_session_id: string;
@@ -111,8 +159,10 @@ interface SdkSessionDetailRow {
 
 export class SessionStore {
   public db: Database;
+  private readonly syncOpsEnabled: boolean;
 
-  constructor(dbPathOrDb: string | Database = DB_PATH) {
+  constructor(dbPathOrDb: string | Database = DB_PATH, options: SessionStoreOptions = {}) {
+    this.syncOpsEnabled = options.syncOpsEnabled ?? true;
     if (dbPathOrDb instanceof Database) {
       this.db = dbPathOrDb;
     } else {
@@ -651,12 +701,12 @@ export class SessionStore {
           throw new Error(`schema v46: missing ${target.table}.${target.column}`);
         }
 
-        for (const raw of this.db.query(`
+        for (const raw of streamRows(this.db.query(`
           SELECT CAST(id AS TEXT) AS row_id,
                  typeof(${target.column}) AS storage_type,
                  CAST(${target.column} AS TEXT) AS revision
           FROM ${target.table}
-        `).iterate()) {
+        `))) {
           const row = raw as { row_id: string; storage_type: string; revision: string | null };
           if (row.storage_type === 'real') {
             throw new Error(
@@ -2042,6 +2092,14 @@ export class SessionStore {
   }
 
   updateMemorySessionId(sessionDbId: number, memorySessionId: string | null): void {
+    const current = this.db.prepare(`
+      SELECT memory_session_id
+      FROM sdk_sessions
+      WHERE id = ?
+    `).get(sessionDbId) as { memory_session_id: string | null } | undefined;
+
+    if (!current || current.memory_session_id === memorySessionId) return;
+
     this.db.prepare(`
       UPDATE sdk_sessions
       SET memory_session_id = ?
@@ -2058,8 +2116,25 @@ export class SessionStore {
    * RULES, SyncApply.ts). Pure SQL, no notify(): callers on the worker
    * connection nudge CloudSync themselves; the startup drain catches the
    * rest.
+   *
+   * Producer gate: acked ops are DELETEd by CloudSync's drain — the queue's
+   * ONLY retention path — and CloudSync exists iff cloud sync is fully
+   * credentialed. With syncOpsEnabled false (unconfigured install) this
+   * no-ops instead of growing sync_outbox forever.
+   *
+   * Supersede, don't append (set_prompt_session): every session
+   * re-registration re-emits the repair for EVERY prompt in the session
+   * (requeuePromptSync), and the mutation site bumps the prompt's sync_rev
+   * before each enqueue — so per target the newest op always carries the
+   * complete field set at the highest rev, and a still-queued older op is
+   * dead weight. Replicas apply by the op.rev >= row sync_rev guard, so
+   * dropping an unsent superseded op cannot regress them; one already pushed
+   * (ack lost mid-flight) is ordered before the newer op in the hub log and
+   * converges the same way. This bounds the outbox at one
+   * set_prompt_session row per prompt regardless of re-registration count.
    */
   private enqueueMutationOp(rev: string | number, body: CanonicalMutation): void {
+    if (!this.syncOpsEnabled) return;
     // set_prompt_session records NULL as the durable "this device" marker;
     // validate the exact mutation shape/UTF-8 bounds with a temporary valid
     // device id before appending. CloudSync substitutes the resolved device
@@ -2070,6 +2145,22 @@ export class SessionStore {
       if (target?.origin_device_id === null) target.origin_device_id = 'self';
     }
     validateCanonicalMutation(candidate);
+    if (body.op === 'set_prompt_session') {
+      // json_valid guards tampered rows from aborting the enqueue (the v49
+      // precedent); every writer stores JSON.stringify output. No rev guard:
+      // the sync_rev bump above each enqueue makes revs monotonic per
+      // target, so the incoming op always supersedes what is queued.
+      this.db.prepare(`
+        DELETE FROM sync_outbox
+        WHERE json_valid(body)
+          AND json_extract(body, '$.op') = 'set_prompt_session'
+          AND json_extract(body, '$.target.origin_device_id') IS ?
+          AND json_extract(body, '$.target.origin_local_id') = ?
+      `).run(
+        (body.target?.origin_device_id ?? null) as string | null,
+        String(body.target?.origin_local_id ?? ''),
+      );
+    }
     this.db.prepare(`
       INSERT INTO sync_outbox (op_uuid, rev, body, created_at_epoch)
       VALUES (?, ?, ?, ?)
@@ -2097,8 +2188,17 @@ export class SessionStore {
    * stampGuard unnecessary: the drain stamps synced_at only where the acked
    * rev still equals the row's sync_rev, so a registration landing while a
    * POST is in flight leaves the row unsynced and it re-pushes corrected.
+   *
+   * With sync ops disabled the whole repair is skipped: the bump + re-null
+   * exist only so already-pushed rows re-push corrected, nothing pushes
+   * without CloudSync, and a prompt that first syncs after a later
+   * enablement resolves its session join fields at snapshot time anyway
+   * (the drain SELECT joins sdk_sessions). Skipping also keeps v47
+   * launch-baseline rows excluded instead of promoting them into sync
+   * eligibility via the rev bump.
    */
   private requeuePromptSync(sessionDbId: number): void {
+    if (!this.syncOpsEnabled) return;
     const session = this.db.prepare(`
       SELECT memory_session_id, project, content_session_id, platform_source
       FROM sdk_sessions WHERE id = ?
@@ -2152,7 +2252,7 @@ export class SessionStore {
     sessionDbId: number,
     memorySessionId: string,
     workerPort?: number
-  ): void {
+  ): string {
     const session = this.db.prepare(`
       SELECT id, memory_session_id, worker_port FROM sdk_sessions WHERE id = ?
     `).get(sessionDbId) as { id: number; memory_session_id: string | null; worker_port: number | null } | undefined;
@@ -2161,7 +2261,27 @@ export class SessionStore {
       throw new Error(`Session ${sessionDbId} not found in sdk_sessions`);
     }
 
-    if (session.memory_session_id !== memorySessionId) {
+    // REGISTER, DO NOT RE-REGISTER. `memory_session_id` is the FK parent key of
+    // `observations` and `session_summaries` (ON UPDATE CASCADE) and the join
+    // field `requeuePromptSync` pushes to replicas, so overwriting it is not a
+    // field update — it rewrites every memory the session owns and re-enqueues
+    // every prompt it has.
+    //
+    // The caller that made this matter is ClaudeProvider: a fresh SDK process
+    // mints a new session_id every turn, `resetCarriedMemorySessionId` clears the
+    // in-memory copy before each one, and nothing consumes a later turn's id
+    // (`shouldResume` is a hardcoded false, so `resume` never receives it). The
+    // condition below used to be `!==`, so every turn looked like a new identity.
+    //
+    // MEASURED on one store: sync_outbox held 1,100,783 rows for 6,930 distinct
+    // prompts — 158.8x, 393 MB of an 854 MB database — with its worst single
+    // prompt carrying 3,464 rows and 3,464 DISTINCT memory_session_ids. That is
+    // `requeuePromptSync`, whose own docstring describes a one-time repair
+    // ("Once the mapping lands"), running once per turn per prompt instead.
+    //
+    // A deliberate change of identity is still available through
+    // `updateMemorySessionId`. "Ensure registered" means make sure one exists.
+    if (session.memory_session_id === null) {
       this.db.prepare(`
         UPDATE sdk_sessions SET memory_session_id = ? WHERE id = ?
       `).run(memorySessionId, sessionDbId);
@@ -2169,8 +2289,13 @@ export class SessionStore {
 
       logger.info('DB', 'Registered memory_session_id before storage (FK fix)', {
         sessionDbId,
-        oldId: session.memory_session_id,
         newId: memorySessionId
+      });
+    } else if (session.memory_session_id !== memorySessionId) {
+      logger.debug('DB', 'Keeping the registered memory_session_id', {
+        sessionDbId,
+        registered: session.memory_session_id,
+        offered: memorySessionId
       });
     }
 
@@ -2183,6 +2308,8 @@ export class SessionStore {
         UPDATE sdk_sessions SET worker_port = ? WHERE id = ?
       `).run(workerPort, sessionDbId);
     }
+
+    return session.memory_session_id ?? memorySessionId;
   }
 
   getAllProjects(platformSource?: string): string[] {
@@ -2583,6 +2710,22 @@ export class SessionStore {
     return result.count;
   }
 
+  getLatestPromptTextFromUserPrompts(contentSessionId: string, sessionDbId?: number): string | null {
+    const resolvedSessionDbId = this.resolvePromptSessionDbId(contentSessionId, sessionDbId);
+    const whereClause = resolvedSessionDbId !== null ? 'session_db_id = ?' : 'content_session_id = ?';
+    const param = resolvedSessionDbId !== null ? resolvedSessionDbId : contentSessionId;
+    const result = this.db.prepare(`
+      SELECT prompt_text
+      FROM user_prompts
+      WHERE ${whereClause}
+        AND prompt_text IS NOT NULL
+        AND length(trim(prompt_text)) > 0
+      ORDER BY prompt_number DESC, created_at_epoch DESC
+      LIMIT 1
+    `).get(param) as { prompt_text: string } | undefined;
+    return result?.prompt_text ?? null;
+  }
+
   createSDKSession(
     contentSessionId: string,
     project: string,
@@ -2733,6 +2876,13 @@ export class SessionStore {
     overrideTimestampEpoch?: number,
     generatedByModel?: string
   ): { id: number; createdAtEpoch: number } {
+    // storeObservations skips empty-title rows, which would leave no id to return here.
+    // This wrapper stores exactly one observation, so require a title up front rather than
+    // returning an undefined id.
+    if (!observation.title || observation.title.trim() === '') {
+      throw new Error('storeObservation requires a non-empty title');
+    }
+
     const result = this.storeObservations(
       memorySessionId,
       project,
@@ -2848,6 +2998,13 @@ export class SessionStore {
       );
 
       for (const observation of observations) {
+        // Skip observations with an empty title. They're malformed, low-signal rows that
+        // just take up space in the recency-based recall window without adding any facts.
+        if (!observation.title || observation.title.trim() === '') {
+          logger.debug('DB', 'Skipping observation with empty title');
+          continue;
+        }
+
         const contentHash = computeObservationContentHash(memorySessionId, observation.title, observation.narrative);
         const inserted = obsStmt.get(
           memorySessionId,

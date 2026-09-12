@@ -1,6 +1,6 @@
 {
   "name": "claude-mem",
-  "version": "13.24.16",
+  "version": "13.24.23",
   "description": "Memory compression system for Claude Code - persist context across sessions",
   "keywords": [
     "claude",
@@ -45,6 +45,7 @@
     "plugin/modes",
     "plugin/scripts/*.js",
     "plugin/scripts/*.cjs",
+    "plugin/scripts/*.map",
     "plugin/sqlite",
     "plugin/skills",
     "plugin/ui",
@@ -52,7 +53,7 @@
   ],
   "engines": {
     "node": ">=20.12.0",
-    "bun": ">=1.0.0"
+    "bun": ">=1.1.31"
   },
   "scripts": {
     "dev": "npm run build-and-sync",
